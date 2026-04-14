@@ -18,6 +18,7 @@ import type {
   OrchestrationProgress,
   SubAgentResult,
 } from './ai-types';
+import type { DesignMdSpec } from '@/types/design-md';
 import { streamChat } from './ai-service';
 import { resolveSkills } from '@zseven-w/pen-ai-skills';
 import { styleGuideRegistry } from '@zseven-w/pen-ai-skills/_generated/style-guide-registry';
@@ -29,6 +30,7 @@ import {
   buildPlanningStyleGuideContext,
   buildCompactPlanningPrompt,
   getBuiltinPlanningTimeouts,
+  DESIGN_MD_STYLE_GUIDE_NAME,
 } from './orchestrator-prompt-optimizer';
 import {
   adjustRootFrameHeightToContent,
@@ -53,6 +55,7 @@ import { addAgentFrame, clearAgentIndicators } from '@/canvas/agent-indicator';
 import { createMobileStatusBar, inferStatusBarVariant } from './mobile-status-bar';
 import { resolveModelProfile } from './model-profiles';
 import { filterPlanningSkillsForPrompt, parseOrchestratorResponse } from './orchestrator-planning';
+import { extractSidebarSurfaceColor } from './orchestrator-sidebar-color';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -212,28 +215,16 @@ function normalizeOrchestratorPlan(plan: OrchestratorPlan, prompt: string): void
   }
 }
 
-function extractSidebarSurfaceColor(plan: OrchestratorPlan): string | undefined {
-  const content = plan.selectedStyleGuideContent;
-  if (!content) return undefined;
-
-  const tableMatch = content.match(/Sidebar Surface\s*\|\s*(#[0-9A-Fa-f]{6})/i);
-  if (tableMatch) return tableMatch[1].toUpperCase();
-
-  const inlineMatch = content.match(/Sidebar Surface[^#]*(#[0-9A-Fa-f]{6})/i);
-  if (inlineMatch) return inlineMatch[1].toUpperCase();
-
-  return undefined;
-}
-
 function createDashboardColumnFrames(
   plan: OrchestratorPlan,
   rootId: string,
+  designMd?: DesignMdSpec,
 ): {
   sidebar: FrameNode;
   main: FrameNode;
 } {
   const sidebarFillColor =
-    extractSidebarSurfaceColor(plan) ??
+    extractSidebarSurfaceColor(plan, designMd) ??
     (plan.rootFrame.fill as Array<{ color?: string }> | undefined)?.[0]?.color ??
     '#0F172A';
   const contentGap =
@@ -528,12 +519,16 @@ export async function executeOrchestration(
         request.provider,
         abortSignal,
         isBuiltin,
+        request.context?.designMd,
       );
     } catch (err) {
       // User abort — propagate so the outer catch cleans up without mutating canvas
       if (abortSignal?.aborted) throw err;
       // Network error, timeout, or provider failure — use heuristic plan
-      plan = buildFallbackPlanFromPrompt(preparedPrompt.orchestratorPrompt);
+      plan = buildFallbackPlanFromPrompt(
+        preparedPrompt.orchestratorPrompt,
+        request.context?.designMd,
+      );
     }
 
     if (shouldUseDashboardColumns(request.prompt, plan)) {
@@ -769,7 +764,11 @@ export async function executeOrchestration(
       }
 
       if (useDashboardColumns) {
-        const dashboardColumns = createDashboardColumnFrames(plan, actualRootId);
+        const dashboardColumns = createDashboardColumnFrames(
+          plan,
+          actualRootId,
+          request.context?.designMd,
+        );
         insertStreamingNode(dashboardColumns.sidebar, actualRootId);
         insertStreamingNode(dashboardColumns.main, actualRootId);
         dashboardColumnIds = {
@@ -1049,6 +1048,7 @@ async function callOrchestrator(
   provider?: AIDesignRequest['provider'],
   abortSignal?: AbortSignal,
   fastTimeout?: boolean,
+  designMd?: DesignMdSpec,
 ): Promise<OrchestratorPlan> {
   const modelProfile = resolveModelProfile(model);
   const attemptModes =
@@ -1079,7 +1079,7 @@ async function callOrchestrator(
     let forcedStyleGuideName: string | undefined;
 
     if (mode === 'compact') {
-      const compact = buildCompactPlanningPrompt(prompt, model);
+      const compact = buildCompactPlanningPrompt(prompt, model, designMd);
       planningSystemPrompt = compact.systemPrompt;
       planningUserPrompt = compact.userPrompt;
       forcedStyleGuideName = compact.selectedStyleGuideName;
@@ -1087,15 +1087,17 @@ async function callOrchestrator(
         model: model ?? 'default',
         tier: modelProfile.tier,
         mode,
+        hasDesignMd: !!designMd,
         selectedStyleGuideName: forcedStyleGuideName,
         systemChars: planningSystemPrompt.length,
       });
     } else {
-      planningGuideContext = buildPlanningStyleGuideContext(prompt, model, mode);
+      planningGuideContext = buildPlanningStyleGuideContext(prompt, model, mode, designMd);
       console.info('[Orchestrator] planning shortlist', {
         model: model ?? 'default',
         tier: modelProfile.tier,
         mode,
+        hasDesignMd: !!designMd,
         metadataCount: planningGuideContext.metadataCount,
         snippetCount: planningGuideContext.snippetCount,
         topGuides: planningGuideContext.topGuideNames,
@@ -1151,7 +1153,7 @@ async function callOrchestrator(
       throw new Error('Aborted');
     }
 
-    const parsed = parseOrchestratorResponse(rawResponse, prompt);
+    const parsed = parseOrchestratorResponse(rawResponse, prompt, designMd);
     if (parsed) {
       if (parsed.repaired) {
         console.info('[Orchestrator] repaired near-miss planning JSON', {
@@ -1166,7 +1168,12 @@ async function callOrchestrator(
       }
       normalizeOrchestratorPlan(plan, prompt);
 
-      if (plan.styleGuideName) {
+      // design.md takes precedence over the pre-built catalog. If the user
+      // has a design.md, we intentionally DO NOT resolve plan.styleGuideName
+      // through styleGuideRegistry — leaving selectedStyleGuideContent
+      // undefined prevents a catalog guide from bleeding into sub-agent
+      // prompts and overriding design.md.
+      if (plan.styleGuideName && !designMd && plan.styleGuideName !== DESIGN_MD_STYLE_GUIDE_NAME) {
         const rootWidth = typeof plan.rootFrame.width === 'number' ? plan.rootFrame.width : 1440;
         const platform = rootWidth <= 500 ? 'mobile' : 'webapp';
 
@@ -1220,7 +1227,7 @@ async function callOrchestrator(
     detail: lastPlanningFailure?.detail,
     preview: lastPlanningFailure?.preview,
   });
-  const fallback = buildFallbackPlanFromPrompt(prompt);
+  const fallback = buildFallbackPlanFromPrompt(prompt, designMd);
   normalizeOrchestratorPlan(fallback, prompt);
   return fallback;
 }
