@@ -41,7 +41,7 @@ export default defineEventHandler(async (event) => {
     const output = await runCommand(claudePath, ['auth', 'login'], 10000);
     const urlMatch = output.match(/(https:\/\/claude\.com\/[^\s]+)/);
     if (urlMatch) {
-      serverLog('login-agent', `OAuth URL generated`);
+      serverLog.info('[login-agent]', `OAuth URL generated`);
       return {
         success: true,
         url: urlMatch[1],
@@ -53,7 +53,7 @@ export default defineEventHandler(async (event) => {
     } satisfies LoginResult;
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Login failed';
-    serverLog('login-agent', `login error: ${msg}`);
+    serverLog.info('[login-agent]', `login error: ${msg}`);
     return { success: false, error: msg } satisfies LoginResult;
   }
 });
