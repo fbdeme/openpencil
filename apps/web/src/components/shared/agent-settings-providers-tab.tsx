@@ -1,7 +1,7 @@
 import { useState, useCallback } from 'react';
 import type { ComponentType, SVGProps } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Check, Loader2, Unplug, Download, ExternalLink } from 'lucide-react';
+import { Check, Loader2, Unplug, Download, ExternalLink, LogIn } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { useAgentSettingsStore } from '@/stores/agent-settings-store';
@@ -96,6 +96,24 @@ async function installAgent(
   }
 }
 
+async function loginAgent(): Promise<{
+  success: boolean;
+  url?: string;
+  error?: string;
+  alreadyLoggedIn?: boolean;
+}> {
+  try {
+    const res = await fetch('/api/ai/login-agent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (!res.ok) return { success: false, error: `Server error ${res.status}` };
+    return await res.json();
+  } catch {
+    return { success: false, error: 'Request failed' };
+  }
+}
+
 /* ---------- ProviderCard ---------- */
 function ProviderCard({ type }: { type: AIProviderType }) {
   const { t } = useTranslation();
@@ -110,6 +128,9 @@ function ProviderCard({ type }: { type: AIProviderType }) {
   const [notInstalled, setNotInstalled] = useState(false);
   const [isInstalling, setIsInstalling] = useState(false);
   const [installInfo, setInstallInfo] = useState<{ command: string; docsUrl: string } | null>(null);
+  const [needsLogin, setNeedsLogin] = useState(false);
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
+  const [loginUrl, setLoginUrl] = useState<string | null>(null);
 
   const meta = PROVIDER_META[type];
 
@@ -119,6 +140,8 @@ function ProviderCard({ type }: { type: AIProviderType }) {
     setWarning(null);
     setNotInstalled(false);
     setInstallInfo(null);
+    setNeedsLogin(false);
+    setLoginUrl(null);
     const result = await connectAgent(meta.agent);
     if (result.connected) {
       connect(type, meta.agent, result.models, result.connectionInfo, result.hintPath);
@@ -127,17 +150,43 @@ function ProviderCard({ type }: { type: AIProviderType }) {
     } else if (result.notInstalled) {
       setNotInstalled(true);
     } else {
-      if (result.error?.startsWith('server_error_')) {
-        const status = result.error.replace('server_error_', '');
+      const errText = result.error || '';
+      if (/login|authenticate|not logged/i.test(errText) && meta.agent === 'claude-code') {
+        setNeedsLogin(true);
+        setError('Not logged in. Click "Login" to authenticate.');
+      } else if (errText.startsWith('server_error_')) {
+        const status = errText.replace('server_error_', '');
         setError(t('agents.serverError', { status }));
-      } else if (result.error && result.error !== 'connection_failed') {
-        setError(result.error);
+      } else if (errText && errText !== 'connection_failed') {
+        setError(errText);
       } else {
         setError(t('agents.connectionFailed'));
       }
     }
     setIsConnecting(false);
   }, [type, meta.agent, connect, persist, t]);
+
+  const handleLogin = useCallback(async () => {
+    setIsLoggingIn(true);
+    setError(null);
+    setLoginUrl(null);
+    const result = await loginAgent();
+    if (result.alreadyLoggedIn) {
+      setNeedsLogin(false);
+      setIsLoggingIn(false);
+      handleConnect();
+      return;
+    }
+    if (result.success && result.url) {
+      setLoginUrl(result.url);
+      window.open(result.url, '_blank');
+      setError('Login page opened. After signing in, click "Connect".');
+      setNeedsLogin(false);
+    } else {
+      setError(result.error || 'Login failed');
+    }
+    setIsLoggingIn(false);
+  }, [handleConnect]);
 
   const handleInstall = useCallback(async () => {
     setIsInstalling(true);
@@ -189,6 +238,14 @@ function ProviderCard({ type }: { type: AIProviderType }) {
         <Button size="sm" disabled className="h-7 px-3 text-[11px] shrink-0">
           <Loader2 size={11} className="animate-spin mr-1" />
           {t('agents.installing')}
+        </Button>
+      );
+    }
+    if (needsLogin) {
+      return (
+        <Button size="sm" onClick={handleLogin} disabled={isLoggingIn} className="h-7 px-3 text-[11px] shrink-0">
+          {isLoggingIn ? <Loader2 size={11} className="animate-spin mr-1" /> : <LogIn size={11} className="mr-1" />}
+          Login
         </Button>
       );
     }
