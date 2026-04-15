@@ -45,7 +45,7 @@ const config = defineConfig({
     },
   },
   ssr: {
-    external: ['@zseven-w/agent-native'],
+    external: ['@zseven-w/agent-native', 'node-pty'],
   },
   assetsInclude: ['**/*.wasm'],
   plugins: [
@@ -60,6 +60,7 @@ const config = defineConfig({
           'cssstyle',
           'canvaskit-wasm',
           '@zseven-w/agent-native',
+          'node-pty',
         ],
       },
       serverDir: './server',
