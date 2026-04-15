@@ -115,7 +115,8 @@ export default defineEventHandler(async (event) => {
 function startLoginAndCaptureUrl(cmd: string): Promise<string | null> {
   return new Promise((resolve, reject) => {
     loginOutput = '';
-    const proc = spawn(cmd, ['auth', 'login'], {
+    // Use script to provide a pseudo-tty so claude auth login accepts stdin
+    const proc = spawn('script', ['-qc', `"${cmd}" auth login`, '/dev/null'], {
       env: { ...process.env, BROWSER: 'none' },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
