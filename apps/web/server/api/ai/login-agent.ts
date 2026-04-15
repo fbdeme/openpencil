@@ -1,5 +1,5 @@
 import { defineEventHandler, readBody, setResponseHeaders } from 'h3';
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { resolveClaudeCli } from '../../utils/resolve-claude-cli';
 import { serverLog } from '../../utils/server-logger';
 
@@ -8,43 +8,103 @@ interface LoginResult {
   url?: string;
   error?: string;
   alreadyLoggedIn?: boolean;
+  needsCode?: boolean;
+}
+
+// Keep the login process alive so we can send the code later
+let activeLoginProc: ChildProcess | null = null;
+let loginOutput = '';
+
+function cleanupLoginProc() {
+  if (activeLoginProc) {
+    activeLoginProc.kill();
+    activeLoginProc = null;
+    loginOutput = '';
+  }
+}
+
+function runAuthStatus(cmd: string): Promise<string> {
+  return new Promise((resolve) => {
+    let output = '';
+    const proc = spawn(cmd, ['auth', 'status'], {
+      env: { ...process.env, BROWSER: 'none' },
+    });
+    proc.stdout?.on('data', (d) => { output += d.toString(); });
+    proc.stderr?.on('data', (d) => { output += d.toString(); });
+    proc.on('close', () => resolve(output));
+    proc.on('error', () => resolve(''));
+  });
 }
 
 /**
  * POST /api/ai/login-agent
- * Triggers `claude auth login` and returns the OAuth URL for browser-based login.
+ * body: {} → starts login, returns OAuth URL
+ * body: { code: "..." } → sends code to waiting process
  */
 export default defineEventHandler(async (event) => {
   setResponseHeaders(event, { 'Content-Type': 'application/json' });
+  const body = await readBody(event).catch(() => ({}));
 
   const claudePath = resolveClaudeCli();
   if (!claudePath) {
     return { success: false, error: 'Claude CLI not found' } satisfies LoginResult;
   }
 
-  // Check if already logged in
-  try {
-    const checkResult = await runCommand(claudePath, ['auth', 'status']);
-    const parsed = JSON.parse(checkResult);
-    if (parsed.loggedIn) {
-      return {
-        success: true,
-        alreadyLoggedIn: true,
-      } satisfies LoginResult;
+  // Step 2: User is sending the OAuth code
+  if (body?.code) {
+    if (!activeLoginProc || !activeLoginProc.stdin) {
+      return { success: false, error: 'No active login session. Click Login again.' } satisfies LoginResult;
     }
-  } catch {
-    // Continue to login
+    try {
+      activeLoginProc.stdin.write(body.code + '\n');
+      // Wait for process to complete
+      const result = await new Promise<boolean>((resolve) => {
+        const timeout = setTimeout(() => {
+          cleanupLoginProc();
+          resolve(false);
+        }, 15000);
+        activeLoginProc!.on('close', async (code) => {
+          clearTimeout(timeout);
+          activeLoginProc = null;
+          // Verify login succeeded
+          const status = await runAuthStatus(claudePath);
+          try {
+            const parsed = JSON.parse(status);
+            resolve(parsed.loggedIn === true);
+          } catch {
+            resolve(false);
+          }
+        });
+      });
+      if (result) {
+        serverLog.info('[login-agent]', 'Login successful');
+        return { success: true } satisfies LoginResult;
+      }
+      return { success: false, error: 'Login failed. Check the code and try again.' } satisfies LoginResult;
+    } catch (err) {
+      cleanupLoginProc();
+      return { success: false, error: 'Failed to send code' } satisfies LoginResult;
+    }
   }
 
-  // Run claude auth login and capture the OAuth URL
-  // The process won't exit (it waits for browser callback), so we resolve as soon as we see the URL
+  // Step 0: Check if already logged in
   try {
-    const output = await captureLoginUrl(claudePath);
-    if (output) {
-      serverLog.info('[login-agent]', 'OAuth URL generated');
-      return { success: true, url: output } satisfies LoginResult;
+    const statusOutput = await runAuthStatus(claudePath);
+    const parsed = JSON.parse(statusOutput);
+    if (parsed.loggedIn) {
+      return { success: true, alreadyLoggedIn: true } satisfies LoginResult;
     }
-    return { success: false, error: 'Could not extract login URL from claude output' } satisfies LoginResult;
+  } catch { /* continue */ }
+
+  // Step 1: Start login and return OAuth URL
+  cleanupLoginProc();
+  try {
+    const url = await startLoginAndCaptureUrl(claudePath);
+    if (url) {
+      serverLog.info('[login-agent]', 'OAuth URL generated, waiting for code');
+      return { success: true, url, needsCode: true } satisfies LoginResult;
+    }
+    return { success: false, error: 'Could not get login URL' } satisfies LoginResult;
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Login failed';
     serverLog.info('[login-agent]', `login error: ${msg}`);
@@ -52,24 +112,25 @@ export default defineEventHandler(async (event) => {
   }
 });
 
-function captureLoginUrl(cmd: string): Promise<string | null> {
+function startLoginAndCaptureUrl(cmd: string): Promise<string | null> {
   return new Promise((resolve, reject) => {
-    let output = '';
+    loginOutput = '';
     const proc = spawn(cmd, ['auth', 'login'], {
       env: { ...process.env, BROWSER: 'none' },
+      stdio: ['pipe', 'pipe', 'pipe'],
     });
+    activeLoginProc = proc;
 
     const timeout = setTimeout(() => {
-      proc.kill();
+      cleanupLoginProc();
       resolve(null);
     }, 15000);
 
     const checkForUrl = (data: Buffer) => {
-      output += data.toString();
-      const match = output.match(/(https:\/\/claude\.com\/[^\s]+)/);
+      loginOutput += data.toString();
+      const match = loginOutput.match(/(https:\/\/claude\.com\/[^\s]+)/);
       if (match) {
         clearTimeout(timeout);
-        // Don't kill the process — it needs to stay alive to complete the OAuth callback
         resolve(match[1]);
       }
     };
@@ -78,11 +139,13 @@ function captureLoginUrl(cmd: string): Promise<string | null> {
     proc.stderr?.on('data', checkForUrl);
     proc.on('error', (err) => {
       clearTimeout(timeout);
+      activeLoginProc = null;
       reject(err);
     });
     proc.on('close', () => {
       clearTimeout(timeout);
-      if (!output.match(/(https:\/\/claude\.com\/[^\s]+)/)) {
+      if (!loginOutput.match(/(https:\/\/claude\.com\/[^\s]+)/)) {
+        activeLoginProc = null;
         resolve(null);
       }
     });

@@ -96,16 +96,18 @@ async function installAgent(
   }
 }
 
-async function loginAgent(): Promise<{
+async function loginAgent(code?: string): Promise<{
   success: boolean;
   url?: string;
   error?: string;
   alreadyLoggedIn?: boolean;
+  needsCode?: boolean;
 }> {
   try {
     const res = await fetch('/api/ai/login-agent', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(code ? { code } : {}),
     });
     if (!res.ok) return { success: false, error: `Server error ${res.status}` };
     return await res.json();
@@ -131,6 +133,8 @@ function ProviderCard({ type }: { type: AIProviderType }) {
   const [needsLogin, setNeedsLogin] = useState(false);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [loginUrl, setLoginUrl] = useState<string | null>(null);
+  const [waitingForCode, setWaitingForCode] = useState(false);
+  const [authCode, setAuthCode] = useState('');
 
   const meta = PROVIDER_META[type];
 
@@ -170,6 +174,8 @@ function ProviderCard({ type }: { type: AIProviderType }) {
     setIsLoggingIn(true);
     setError(null);
     setLoginUrl(null);
+    setWaitingForCode(false);
+    setAuthCode('');
     const result = await loginAgent();
     if (result.alreadyLoggedIn) {
       setNeedsLogin(false);
@@ -180,13 +186,29 @@ function ProviderCard({ type }: { type: AIProviderType }) {
     if (result.success && result.url) {
       setLoginUrl(result.url);
       window.open(result.url, '_blank');
-      setError('Login page opened. After signing in, click "Connect".');
+      setWaitingForCode(true);
       setNeedsLogin(false);
+      setError(null);
     } else {
       setError(result.error || 'Login failed');
     }
     setIsLoggingIn(false);
   }, [handleConnect]);
+
+  const handleSubmitCode = useCallback(async () => {
+    if (!authCode.trim()) return;
+    setIsLoggingIn(true);
+    setError(null);
+    const result = await loginAgent(authCode.trim());
+    if (result.success) {
+      setWaitingForCode(false);
+      setAuthCode('');
+      handleConnect();
+    } else {
+      setError(result.error || 'Login failed');
+    }
+    setIsLoggingIn(false);
+  }, [authCode, handleConnect]);
 
   const handleInstall = useCallback(async () => {
     setIsInstalling(true);
@@ -349,6 +371,33 @@ function ProviderCard({ type }: { type: AIProviderType }) {
               <ExternalLink size={9} />
             </a>
           )}
+        </div>
+      )}
+
+      {/* OAuth code input (shown after login URL opens) */}
+      {waitingForCode && (
+        <div className="mx-3 mt-1 mb-1 px-2.5 py-2 rounded-md bg-secondary/30">
+          <p className="text-[11px] text-muted-foreground mb-1.5">
+            Sign in on the opened page, then paste the code here:
+          </p>
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              value={authCode}
+              onChange={(e) => setAuthCode(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && handleSubmitCode()}
+              placeholder="Paste auth code here..."
+              className="flex-1 h-7 px-2 text-[11px] font-mono rounded border border-border bg-background text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+            />
+            <Button
+              size="sm"
+              onClick={handleSubmitCode}
+              disabled={isLoggingIn || !authCode.trim()}
+              className="h-7 px-3 text-[11px] shrink-0"
+            >
+              {isLoggingIn ? <Loader2 size={11} className="animate-spin" /> : 'Submit'}
+            </Button>
+          </div>
         </div>
       )}
 
