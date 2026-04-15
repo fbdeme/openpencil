@@ -56,21 +56,36 @@ export default defineEventHandler(async (event) => {
       return { success: false, error: 'No active login session. Click Login again.' } satisfies LoginResult;
     }
     try {
+      serverLog.info('[login-agent]', `Sending code (${body.code.length} chars) to login process`);
+      // Capture all output from the process for debugging
+      let procOutput = '';
+      activeLoginProc.stdout?.on('data', (d: Buffer) => { procOutput += d.toString(); });
+      activeLoginProc.stderr?.on('data', (d: Buffer) => { procOutput += d.toString(); });
+
       activeLoginProc.stdin.write(body.code + '\n');
       // Additional enters required by the login flow
-      setTimeout(() => activeLoginProc?.stdin?.write('\n'), 500);
-      setTimeout(() => activeLoginProc?.stdin?.write('\n'), 1000);
+      setTimeout(() => {
+        serverLog.info('[login-agent]', 'Sending extra enter 1');
+        activeLoginProc?.stdin?.write('\n');
+      }, 500);
+      setTimeout(() => {
+        serverLog.info('[login-agent]', 'Sending extra enter 2');
+        activeLoginProc?.stdin?.write('\n');
+      }, 1000);
       // Wait for process to complete
       const result = await new Promise<boolean>((resolve) => {
         const timeout = setTimeout(() => {
+          serverLog.info('[login-agent]', `Timeout. Process output: ${procOutput}`);
           cleanupLoginProc();
           resolve(false);
         }, 15000);
-        activeLoginProc!.on('close', async (code) => {
+        activeLoginProc!.on('close', async (exitCode) => {
           clearTimeout(timeout);
+          serverLog.info('[login-agent]', `Process closed with code ${exitCode}. Output: ${procOutput}`);
           activeLoginProc = null;
           // Verify login succeeded
           const status = await runAuthStatus(claudePath);
+          serverLog.info('[login-agent]', `Auth status after login: ${status}`);
           try {
             const parsed = JSON.parse(status);
             resolve(parsed.loggedIn === true);
