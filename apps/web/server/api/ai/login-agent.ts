@@ -11,15 +11,15 @@ interface LoginResult {
   needsCode?: boolean;
 }
 
-// Keep the login process alive so we can send the code later
-let activeLoginProc: ChildProcess | null = null;
-let loginOutput = '';
+// Store the pty process so we can write to it later
+let activePty: any = null;
+let ptyOutput = '';
 
-function cleanupLoginProc() {
-  if (activeLoginProc) {
-    activeLoginProc.kill();
-    activeLoginProc = null;
-    loginOutput = '';
+function cleanupPty() {
+  if (activePty) {
+    try { activePty.kill(); } catch {}
+    activePty = null;
+    ptyOutput = '';
   }
 }
 
@@ -39,7 +39,7 @@ function runAuthStatus(cmd: string): Promise<string> {
 /**
  * POST /api/ai/login-agent
  * body: {} → starts login, returns OAuth URL
- * body: { code: "..." } → sends code to waiting process
+ * body: { code: "..." } → sends code to waiting pty process
  */
 export default defineEventHandler(async (event) => {
   setResponseHeaders(event, { 'Content-Type': 'application/json' });
@@ -52,56 +52,58 @@ export default defineEventHandler(async (event) => {
 
   // Step 2: User is sending the OAuth code
   if (body?.code) {
-    if (!activeLoginProc || !activeLoginProc.stdin) {
+    if (!activePty) {
       return { success: false, error: 'No active login session. Click Login again.' } satisfies LoginResult;
     }
     try {
-      serverLog.info('[login-agent]' + `Sending code (${body.code.length} chars) to login process`);
-      // Capture all output from the process for debugging
-      let procOutput = '';
-      activeLoginProc.stdout?.on('data', (d: Buffer) => { procOutput += d.toString(); });
-      activeLoginProc.stderr?.on('data', (d: Buffer) => { procOutput += d.toString(); });
+      serverLog.info('[login-agent] Sending code (' + body.code.length + ' chars) to pty');
+      ptyOutput = '';
+      activePty.write(body.code + '\r');
+      // Extra enters after a delay
+      setTimeout(() => { try { activePty?.write('\r'); } catch {} }, 500);
+      setTimeout(() => { try { activePty?.write('\r'); } catch {} }, 1000);
 
-      activeLoginProc.stdin.write(body.code + '\n');
-      // Additional enters required by the login flow
-      setTimeout(() => {
-        serverLog.info('[login-agent]' + 'Sending extra enter 1');
-        activeLoginProc?.stdin?.write('\n');
-      }, 500);
-      setTimeout(() => {
-        serverLog.info('[login-agent]' + 'Sending extra enter 2');
-        activeLoginProc?.stdin?.write('\n');
-      }, 1000);
-      // Wait for process to complete
+      // Wait for process to finish
       const result = await new Promise<boolean>((resolve) => {
         const timeout = setTimeout(() => {
-          serverLog.info('[login-agent]' + `Timeout. Process output: ${procOutput}`);
-          cleanupLoginProc();
+          serverLog.info('[login-agent] Code submit timeout. pty output: ' + ptyOutput.substring(0, 500));
+          cleanupPty();
           resolve(false);
-        }, 15000);
-        activeLoginProc!.on('close', async (exitCode) => {
-          clearTimeout(timeout);
-          serverLog.info('[login-agent]' + `Process closed with code ${exitCode}. Output: ${procOutput}`);
-          activeLoginProc = null;
-          // Verify login succeeded
-          const status = await runAuthStatus(claudePath);
-          serverLog.info('[login-agent]' + `Auth status after login: ${status}`);
+        }, 20000);
+
+        const checkDone = setInterval(async () => {
+          // Check if login succeeded by polling auth status
           try {
+            const status = await runAuthStatus(claudePath);
             const parsed = JSON.parse(status);
-            resolve(parsed.loggedIn === true);
-          } catch {
-            resolve(false);
-          }
-        });
+            if (parsed.loggedIn) {
+              clearTimeout(timeout);
+              clearInterval(checkDone);
+              serverLog.info('[login-agent] Login verified as successful');
+              cleanupPty();
+              resolve(true);
+            }
+          } catch {}
+        }, 2000);
+
+        if (activePty.onExit) {
+          activePty.onExit(() => {
+            clearTimeout(timeout);
+            clearInterval(checkDone);
+            activePty = null;
+          });
+        }
       });
+
       if (result) {
-        serverLog.info('[login-agent]' + 'Login successful');
         return { success: true } satisfies LoginResult;
       }
       return { success: false, error: 'Login failed. Check the code and try again.' } satisfies LoginResult;
     } catch (err) {
-      cleanupLoginProc();
-      return { success: false, error: 'Failed to send code' } satisfies LoginResult;
+      const msg = err instanceof Error ? err.message : 'Failed to send code';
+      serverLog.info('[login-agent] Code submit error: ' + msg);
+      cleanupPty();
+      return { success: false, error: msg } satisfies LoginResult;
     }
   }
 
@@ -114,57 +116,100 @@ export default defineEventHandler(async (event) => {
     }
   } catch { /* continue */ }
 
-  // Step 1: Start login and return OAuth URL
-  cleanupLoginProc();
+  // Step 1: Start login with node-pty and capture OAuth URL
+  cleanupPty();
   try {
-    const url = await startLoginAndCaptureUrl(claudePath);
+    const url = await startLoginPty(claudePath);
     if (url) {
-      serverLog.info('[login-agent]' + 'OAuth URL generated, waiting for code');
+      serverLog.info('[login-agent] OAuth URL generated, waiting for code');
       return { success: true, url, needsCode: true } satisfies LoginResult;
     }
     return { success: false, error: 'Could not get login URL' } satisfies LoginResult;
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Login failed';
-    serverLog.info('[login-agent]' + `login error: ${msg}`);
+    serverLog.info('[login-agent] Start login error: ' + msg);
     return { success: false, error: msg } satisfies LoginResult;
   }
 });
 
-function startLoginAndCaptureUrl(cmd: string): Promise<string | null> {
-  return new Promise((resolve, reject) => {
-    loginOutput = '';
-    // Use script to provide a pseudo-tty so claude auth login accepts stdin
+async function startLoginPty(cmd: string): Promise<string | null> {
+  let pty: typeof import('node-pty');
+  try {
+    pty = await import('node-pty');
+  } catch {
+    // Fallback: try require
+    try {
+      pty = require('node-pty');
+    } catch (e) {
+      serverLog.info('[login-agent] node-pty not available, falling back to spawn');
+      return startLoginFallback(cmd);
+    }
+  }
+
+  return new Promise((resolve) => {
+    ptyOutput = '';
+    const proc = pty.spawn(cmd, ['auth', 'login'], {
+      name: 'xterm',
+      cols: 200,
+      rows: 30,
+      env: { ...process.env, BROWSER: 'none' } as Record<string, string>,
+    });
+    activePty = proc;
+
+    const timeout = setTimeout(() => {
+      serverLog.info('[login-agent] URL capture timeout. Output: ' + ptyOutput.substring(0, 500));
+      cleanupPty();
+      resolve(null);
+    }, 15000);
+
+    proc.onData((data: string) => {
+      ptyOutput += data;
+      const match = ptyOutput.match(/(https:\/\/claude\.com\/[^\s\x1b]+)/);
+      if (match) {
+        clearTimeout(timeout);
+        resolve(match[1]);
+      }
+    });
+
+    proc.onExit?.(() => {
+      clearTimeout(timeout);
+      if (!ptyOutput.match(/(https:\/\/claude\.com\/[^\s\x1b]+)/)) {
+        activePty = null;
+        resolve(null);
+      }
+    });
+  });
+}
+
+// Fallback without node-pty using script command
+function startLoginFallback(cmd: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    ptyOutput = '';
     const proc = spawn('script', ['-qc', `"${cmd}" auth login`, '/dev/null'], {
       env: { ...process.env, BROWSER: 'none' },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    activeLoginProc = proc;
+    activePty = { write: (d: string) => proc.stdin?.write(d), kill: () => proc.kill() };
 
     const timeout = setTimeout(() => {
-      cleanupLoginProc();
+      cleanupPty();
       resolve(null);
     }, 15000);
 
-    const checkForUrl = (data: Buffer) => {
-      loginOutput += data.toString();
-      const match = loginOutput.match(/(https:\/\/claude\.com\/[^\s]+)/);
+    const check = (data: Buffer) => {
+      ptyOutput += data.toString();
+      const match = ptyOutput.match(/(https:\/\/claude\.com\/[^\s\x1b]+)/);
       if (match) {
         clearTimeout(timeout);
         resolve(match[1]);
       }
     };
-
-    proc.stdout?.on('data', checkForUrl);
-    proc.stderr?.on('data', checkForUrl);
-    proc.on('error', (err) => {
-      clearTimeout(timeout);
-      activeLoginProc = null;
-      reject(err);
-    });
+    proc.stdout?.on('data', check);
+    proc.stderr?.on('data', check);
     proc.on('close', () => {
       clearTimeout(timeout);
-      if (!loginOutput.match(/(https:\/\/claude\.com\/[^\s]+)/)) {
-        activeLoginProc = null;
+      if (!ptyOutput.match(/(https:\/\/claude\.com\/[^\s\x1b]+)/)) {
+        activePty = null;
         resolve(null);
       }
     });
