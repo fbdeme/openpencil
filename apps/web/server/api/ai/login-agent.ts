@@ -57,6 +57,9 @@ export default defineEventHandler(async (event) => {
     }
     try {
       activeLoginProc.stdin.write(body.code + '\n');
+      // Additional enters required by the login flow
+      setTimeout(() => activeLoginProc?.stdin?.write('\n'), 500);
+      setTimeout(() => activeLoginProc?.stdin?.write('\n'), 1000);
       // Wait for process to complete
       const result = await new Promise<boolean>((resolve) => {
         const timeout = setTimeout(() => {
