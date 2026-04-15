@@ -180,25 +180,32 @@ async function connectClaudeCode(): Promise<ConnectResult> {
     // Check auth status first before querying models
     try {
       const { execSync } = await import('node:child_process');
-      const authJson = execSync(`"${claudePath}" auth status`, {
-        encoding: 'utf-8',
-        timeout: 10000,
-        env,
-      }).trim();
-      const authStatus = JSON.parse(authJson);
-      if (!authStatus.loggedIn) {
-        q.close();
-        serverLog.info('[connect-agent] claude not logged in');
-        return {
-          connected: false,
-          models: [],
-          error: 'Not logged in. Click "Login" to authenticate.',
-          notInstalled: false,
-        };
+      let authJson: string;
+      try {
+        authJson = execSync(`"${claudePath}" auth status`, {
+          encoding: 'utf-8',
+          timeout: 10000,
+          env,
+        }).trim();
+      } catch (execErr: any) {
+        // claude auth status exits with code 1 when not logged in, but still outputs JSON to stdout
+        authJson = (execErr.stdout || execErr.stderr || '').trim();
+      }
+      if (authJson) {
+        const authStatus = JSON.parse(authJson);
+        serverLog.info(`[connect-agent] auth status: loggedIn=${authStatus.loggedIn}`);
+        if (!authStatus.loggedIn) {
+          q.close();
+          return {
+            connected: false,
+            models: [],
+            error: 'Not logged in. Click "Login" to authenticate.',
+            notInstalled: false,
+          };
+        }
       }
     } catch (authErr) {
       serverLog.info(`[connect-agent] auth status check failed: ${authErr}`);
-      // Continue anyway — auth status command may not be available
     }
 
     serverLog.info('[connect-agent] querying supportedModels...');
