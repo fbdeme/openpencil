@@ -274,7 +274,8 @@ function streamViaAgentSDK(body: ChatBody, requestedModel?: string) {
                 `First, use the Read tool to read the image file at "${f}". Then analyze it and respond to the user.`,
             )
             .join('\n');
-          prompt = imageRefs + '\n\n' + (prompt || 'Describe what you see in the image.');
+          const imageReproductionHint = '\n\nIMPORTANT: The user has attached a reference image. Unless they explicitly ask for something else, faithfully reproduce the visual appearance of this image as a design on the canvas. Do NOT convert it into web UI components (hero, navbar, footer, etc.). Reproduce the actual shapes, text, colors, and spatial layout as seen in the image. Use the generate_design tool with a prompt that describes the visual elements exactly as they appear.';
+          prompt = imageRefs + '\n\n' + (prompt || 'Describe what you see in the image.') + imageReproductionHint;
         }
 
         // Remove CLAUDECODE env to allow running from within a CC terminal
